@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Sequencer-1.1 — token-by-token generation engine.
+Sequencer-1.1 -- token-by-token text engine.
 
-Language is auto-detected from the prompt's script unless
---lang is passed explicitly. No third-party dependencies.
+Stories, answers, whatever you feed it: end the prompt with a ? (or open
+with who/what/why/...) and it answers instead of narrating. English only.
+Every table the model knows -- words, grammar, the old detect_lang script
+table, the tunables -- lives in db/model.parameters.json. This file is
+just machinery. No third-party dependencies.
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import logging
 import math
@@ -17,11 +19,10 @@ import random
 import re
 import sys
 import time
-from bisect import bisect_left
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 LOG = logging.getLogger("Sequencer-1.1")
 
@@ -30,7 +31,47 @@ END = "<end>"
 NL = "\n"
 EMPTY = "<empty>"
 
-CONTEXT_WINDOW = 512
+PARAM_FILE = Path(__file__).resolve().parent / "db" / "model.parameters.json"
+
+# Tokens are lowercased and stripped of these marks; the CJK punctuation
+# rides along so it doesn't wedge itself into a "word".
+_STRIP = "，。！？、,.!?;:\"'"
+
+
+def _clean(w: str) -> str:
+    return w.lower().strip(_STRIP)
+
+
+def load_params(path: Path = PARAM_FILE) -> dict:
+    # nothing is baked into the code anymore, so a missing file is fatal
+    if not path.exists():
+        sys.exit(f"sequencer: can't find {path}, refusing to make things up")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError as exc:  # FIX: readable error, not a traceback
+        sys.exit(f"sequencer: {path} isn't valid json: {exc}")
+
+
+def detect_lang(text: str, table: List[dict]) -> str:
+    """Same script table the old builds used, it just loads from the json
+    now. Only english ships a pack, so other hits fall back in main()."""
+    # FIX: an empty or missing table used to raise IndexError on table[-1]
+    if not table:
+        return ""
+    fallback = table[-1].get("lang", "")
+    if not text:
+        return fallback
+    for row in table:
+        pat = row.get("pattern", "")
+        if not pat:
+            continue
+        try:
+            if re.search(pat, text):
+                return row["lang"]
+        except re.error:  # FIX: a bad pattern in the table shouldn't crash us
+            LOG.warning("bad detect_lang pattern: %r", pat)
+    return fallback
 
 
 # ===========================================================================
@@ -48,78 +89,43 @@ class RenderCfg:
 
 
 # ===========================================================================
-# Load model parameters (no hard-coded lexicon / transitions / detect table)
+# Context window
 # ===========================================================================
 
-_MODEL_PATH = Path(__file__).resolve().parent / "db" / "model.parameters.json"
-
-def _load_model() -> dict:
-    if not _MODEL_PATH.is_file():
-        raise FileNotFoundError(
-            "model parameters missing: %s" % _MODEL_PATH)
-    with open(_MODEL_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    for key in ("lexicon", "transitions", "detect_lang"):
-        if key not in data:
-            raise ValueError("model.parameters.json missing key: %s" % key)
-    return data
-
-_MODEL = _load_model()
-_EN_LEX_RAW = _MODEL["lexicon"]
-_EN_TR = _MODEL["transitions"]
-_DETECT_TABLE = _MODEL["detect_lang"]
-
-# rebuild lexicon with tuples
-_EN_LEX: Dict[str, List[Tuple[str, str, float]]] = {
-    role: [(w, g, float(b)) for w, g, b in entries]
-    for role, entries in _EN_LEX_RAW.items()
-}
-
-
-# ===========================================================================
-# Language registry (English only)
-# ===========================================================================
-
-def _make_pack(code, name, native, lexicon, transitions, render,
-               max_tokens=22, word_order="SVO"):
-    w2r: Dict[str, str] = {}
-    for role, entries in lexicon.items():
-        for w, _feat, _base in entries:
-            key = w.lower().strip("，。！？、,.!?;:\"'")
-            if key and key not in w2r:
-                w2r[key] = role
-    return {
-        "code": code, "name": name, "native": native,
-        "lexicon": lexicon, "transitions": transitions,
-        "render": render, "max_tokens": max_tokens,
-        "word_order": word_order, "word_to_role": w2r,
-    }
-
-
-_RENDER_EN = RenderCfg(
-    spaces=True, capitalize=True,
-    punct_map={". ": ". ", ".": ".", "!": "!", "?": "?", ",": ","})
-
-LANGS: Dict[str, dict] = {
-    "en": _make_pack("en", "English", "English",
-                     _EN_LEX, _EN_TR, _RENDER_EN, word_order="SVO"),
-}
-
-DEFAULT_LANG = "en"
-
-
-def detect_lang(text: str) -> str:
-    """Detect the language of a prompt by its Unicode script.
-    Table loaded from model.parameters.json; not removed.
+class ContextWindow:
     """
-    if not text:
-        return _DETECT_TABLE.get("default", DEFAULT_LANG)
-    for code, pattern in _DETECT_TABLE.items():
-        if code == "default":
-            continue
-        if re.search(pattern, text):
-            return code
-    return _DETECT_TABLE.get("default", DEFAULT_LANG)
+    The last `size` characters worth of tokens, plus a running count of
+    how many times each token appears in the window.
+
+    `counts` answers "did we already say this?" in O(1), and it is
+    pruned as the window slides, so it always reflects exactly the
+    tokens still in `buf`. No sorted copy needed -- the counter *is*
+    the membership test.
+    """
+
+    def __init__(self, size: int) -> None:
+        self.size = max(16, int(size))
+        self.chars = 0
+        self.buf: Deque[str] = deque()
+        self.counts: Counter = Counter()
+
+    def add(self, tok: str) -> None:
+        tok = _clean(tok)
+        if not tok:
+            return
+        self.buf.append(tok)
+        self.chars += len(tok)
+        self.counts[tok] += 1
+        while self.chars > self.size:
+            old = self.buf.popleft()
+            self.chars -= len(old)
+            self.counts[old] -= 1
+            if self.counts[old] <= 0:
+                del self.counts[old]
+
+    def seen(self, tok: str) -> bool:
+        tok = _clean(tok)
+        return bool(tok) and tok in self.counts
 
 
 # ===========================================================================
@@ -132,7 +138,6 @@ class State:
     prev_role: str = START
     subject_gender: str = ""
     subject_number: str = "sing"
-    last_entity_gender: str = ""
     in_pp: bool = False
     have_subject: bool = False
     have_verb: bool = False
@@ -140,14 +145,10 @@ class State:
     after_copula: bool = False
     copula_noun_done: bool = False
     needs_main: bool = False
-    pending_noun: Optional[Tuple[str, str, str]] = None
-    recent: Deque[str] = field(default_factory=lambda: deque(maxlen=40))
-    recent_counts: Counter = field(default_factory=Counter)
     tokens: int = 0
     sentences: int = 0
     words: int = 0
     stopped: bool = False
-    context: str = ""  # last CONTEXT_WINDOW characters
 
 
 # ===========================================================================
@@ -155,36 +156,56 @@ class State:
 # ===========================================================================
 
 class Sequencer:
-    """Token-by-token generator. Reads parameters from model; context-aware."""
+    """Token-by-token generator. Reads everything from the params dict."""
 
-    def __init__(self, lang: str = DEFAULT_LANG,
-                 seed: Optional[int] = None,
+    def __init__(self, params: dict, seed: Optional[int] = None,
                  stream: bool = True, speed: float = 0.02,
-                 show_end: bool = True) -> None:
-        if lang not in LANGS:
-            # fall back to English only
-            lang = DEFAULT_LANG
-        self.lang = lang
-        self.pack = LANGS[lang]
-        self.lexicon = self.pack["lexicon"]
-        self.transitions = self.pack["transitions"]
-        self.render = self.pack["render"]
+                 show_end: bool = True, mode: str = "auto",
+                 lang: Optional[str] = None) -> None:
+        self.params = params
+        self.lang = lang or params.get("default_lang", "en")
+        packs = params.get("packs", {})
+        if self.lang not in packs:
+            sys.exit(f"sequencer: no pack for {self.lang!r} in the json")
+        pack = packs[self.lang]
+        try:
+            self.lexicon: Dict[str, list] = pack["lexicon"]
+            self.transitions: Dict[str, dict] = pack["transitions"]
+        except KeyError as exc:  # FIX: readable error instead of KeyError
+            sys.exit(f"sequencer: pack {self.lang!r} is missing {exc}")
+        r = pack.get("render", {})
+        self.render = RenderCfg(r.get("spaces", True), r.get("capitalize", True),
+                                dict(r.get("punct_map", {})))
+        self.max_sent = int(pack.get("max_tokens", 22))
+        self.word_order = pack.get("word_order", "SVO")
+        self.word_to_role = self._build_word_to_role(self.lexicon)
+
+        self.qa = params.get("qa", {})
+        self.ctx = ContextWindow(params.get("context_chars", 512))
+        w = params.get("weights", {})
+        self.w_decay = float(w.get("repeat_decay", 0.4))
+        self.w_bias = float(w.get("prompt_bias", 2.2))
+
+        self.mode = mode
         self.rng = random.Random(seed)
         self.stream = stream
         self.speed = speed
         self.show_end = show_end
         self.state = State()
+        self.bias: Set[str] = set()
         self._needs_space = False
         self._sentence_start = True
+        self._last_char = ""  # FIX: so _close can avoid writing ",."
 
-    def set_lang(self, lang: str) -> None:
-        if lang not in LANGS:
-            lang = DEFAULT_LANG
-        self.lang = lang
-        self.pack = LANGS[lang]
-        self.lexicon = self.pack["lexicon"]
-        self.transitions = self.pack["transitions"]
-        self.render = self.pack["render"]
+    @staticmethod
+    def _build_word_to_role(lexicon: Dict[str, list]) -> Dict[str, str]:
+        w2r: Dict[str, str] = {}
+        for role, entries in lexicon.items():
+            for entry in entries:
+                key = _clean(entry[0])
+                if key and any(c.isalnum() for c in key) and key not in w2r:
+                    w2r[key] = role
+        return w2r
 
     # -------- output --------
 
@@ -195,9 +216,8 @@ class Sequencer:
     def _write_raw(self, text: str) -> None:
         sys.stdout.write(text)
         sys.stdout.flush()
-        # maintain context window of 512 characters
-        st = self.state
-        st.context = (st.context + text)[-CONTEXT_WINDOW:]
+        if text:
+            self._last_char = text[-1]
 
     def _emit_word(self, word: str, capitalize: bool = False) -> None:
         if not word:
@@ -229,67 +249,28 @@ class Sequencer:
         else:
             self._write_raw("\n")
 
-    # -------- weighting (context-aware, O(log n) selection helpers) --------
+    # -------- weighting --------
 
     def _word_weight(self, word: str, base: float) -> float:
-        # length term stays logarithmic
         complexity = 1.0 / (1.0 + math.log(1.0 + len(word)) / 4.0)
-        key = word.lower().strip("，。！？、,.!?;:\"'")
-        count = self.state.recent_counts.get(key, 0)
-        ctx = self.state.context
-        n = len(ctx) if ctx else 1
-        bias = 1.0
-        if key and ctx:
-            # O(log n) membership on sorted unique tokens from the context window
-            tokens = sorted(set(re.findall(r"[a-z0-9']+", ctx.lower())))
-            idx = bisect_left(tokens, key)
-            if idx < len(tokens) and tokens[idx] == key:
-                # word already in context — stronger pull for coherent continuation
-                bias *= 1.0 + (0.35 * math.log1p(n))
-            else:
-                # weaker letter-level signal still helps related vocabulary
-                letters = sorted(set(ctx.lower()))
-                for ch in key:
-                    j = bisect_left(letters, ch)
-                    if j < len(letters) and letters[j] == ch:
-                        bias *= 1.0 + (0.04 * math.log1p(n))
-                        break
-        return base * complexity * (0.4 ** count) * bias
+        key = _clean(word)
+        if key in self.bias:
+            # things the prompt asked about jump the queue, once
+            return base * complexity * self.w_bias
+        count = self.ctx.counts.get(key, 0)
+        return base * complexity * (self.w_decay ** count)
 
     def _record(self, word: str) -> None:
-        key = word.lower().strip("，。！？、,.!?;:\"'")
-        if not key:
-            return
-        self.state.recent.append(key)
-        self.state.recent_counts[key] += 1
-        if self.state.recent_counts[key] > 6:
-            self.state.recent_counts = Counter(self.state.recent)
-
-    def _weighted_choice(self, items: Sequence, weights: Sequence[float]):
-        """O(log n) selection via prefix sums + binary search. n = len(items)."""
-        if not items:
-            return None
-        if len(items) == 1:
-            return items[0]
-        # build prefix
-        prefix = []
-        total = 0.0
-        for w in weights:
-            total += max(0.0, w)
-            prefix.append(total)
-        if total <= 0:
-            return self.rng.choice(list(items))
-        r = self.rng.random() * total
-        idx = bisect_left(prefix, r)
-        if idx >= len(items):
-            idx = len(items) - 1
-        return items[idx]
+        self.ctx.add(word)
 
     # -------- selection --------
 
     def _pick_role_from(self, last: str) -> str:
         st = self.state
-        dist = dict(self.transitions.get(last, self.transitions.get(START, {})))
+        # FIX: missing START key used to raise KeyError; empty dist used
+        # to hand START straight back and spin the generator forever
+        dist = dict(self.transitions.get(last)
+                    or self.transitions.get(START) or {})
 
         if last == "M" and st.prev_role == "U":
             dist = {".": 35, NL: 35, ",": 8, "P": 15, "C": 5, "!": 2}
@@ -297,66 +278,100 @@ class Sequencer:
         if last == "D" and st.in_pp:
             dist = {"L": 55, "J": 15, "B": 10, "E": 10, "A": 5, "N": 5}
 
-        if last in ("N", "A") and not st.have_verb and \
-                self.pack["word_order"] == "SVO":
+        if last in ("N", "A") and not st.have_verb and self.word_order == "SVO":
             dist = {"V": 75, "U": 15, "K": 5, "P": 3, "C": 2}
 
+        if not dist:
+            return "."
         roles = list(dist.keys())
         weights = list(dist.values())
-        if not roles:
-            return START
-        # O(log n) pick
-        return self._weighted_choice(roles, weights)
+        total = sum(weights)
+        if total <= 0:
+            return "."
+        return self.rng.choices(roles, weights=weights, k=1)[0]
+
+    def _can_say(self, role: str) -> bool:
+        """A role is only emittable if the lexicon actually has words for it."""
+        return bool(self.lexicon.get(role))
 
     def _pick_next_role(self) -> str:
         st = self.state
 
         if st.copula_noun_done:
-            return "K" if "K" in self.transitions else "."
+            # FIX: used to check the transition table, which could force a
+            # role with no lexicon entries (and print the _START_ sentinel)
+            if self._can_say("K"):
+                return "K"
+            return "."
 
-        if st.sentence_tokens >= self.pack["max_tokens"]:
-            return self._weighted_choice([".", "!", "?"], [85, 10, 5])
+        if st.sentence_tokens >= self.max_sent:
+            return self.rng.choices([".", "!", "?"],
+                                    weights=[85, 10, 5], k=1)[0]
 
         if st.sentence_tokens >= 15 and st.have_subject and not st.have_verb:
-            return "V"
+            return "V" if self._can_say("V") else "."
 
         role = self._pick_role_from(st.last_role)
 
         if role == START:
             role = self._pick_role_from(START)
+            if role == START:  # FIX: no transitions at all -> stop cleanly
+                role = "."
 
         if role == "R" and not st.subject_gender:
-            role = "D" if "D" in self.transitions else "N"
+            role = "D" if self._can_say("D") else \
+                   ("N" if self._can_say("N") else ".")
 
         if role in (".", "!", "?", NL):
             if not (st.have_subject and st.have_verb):
+                # SVO: force a verb first; SOV would take a particle
                 if st.have_subject:
-                    role = "V" if "V" in self.transitions else "PART"
+                    role = "V" if self._can_say("V") else \
+                           ("PART" if self._can_say("PART") else ".")
                 else:
-                    role = "D" if "D" in self.transitions else "N"
+                    role = "D" if self._can_say("D") else \
+                           ("N" if self._can_say("N") else ".")
 
         if st.after_copula and st.last_role == "U" and \
                 role not in ("D", "M", "N", "J", "L", "B", "A"):
-            role = "D" if "D" in self.transitions else "M"
+            role = "D" if self._can_say("D") else \
+                   ("M" if self._can_say("M") else ".")
 
         if st.needs_main and role in (".", "!", "?", NL) and not st.have_verb:
-            role = "V"
+            role = "V" if self._can_say("V") else "."
 
         return role
 
     def _pick_word(self, role: str) -> Tuple[str, str]:
-        entries = self.lexicon.get(role) or [(START, "", 1.0)]
+        """
+        Returns (word, gender). Entries are [word, gender, weight] -- or
+        optionally [word, gender, weight, forms], where `forms` is a
+        number-keyed map of alternate spellings for verbs and copulas,
+        e.g. ["run", "", 1.0, {"sing": "runs"}]. The base word is the
+        fallback when the subject's number isn't listed, so a 3-tuple
+        stays valid.
+        """
+        entries = self.lexicon.get(role)
+        # FIX: the old fallback was [(START, "", 1.0)], which printed the
+        # literal sentinel word. A missing role now yields no word at all.
         if not entries:
-            return START, ""
+            return "", ""
+
         if len(entries) == 1:
-            w, g, _ = entries[0]
-            return w, g
-        weights = [max(0.001, self._word_weight(w, base))
-                   for w, _, base in entries]
-        # O(log n) choice over lexicon size
-        chosen = self._weighted_choice(entries, weights)
-        w, g, _ = chosen
-        return w, g
+            entry = entries[0]
+        else:
+            weights = [max(0.001, self._word_weight(e[0], e[2]))
+                       for e in entries]
+            idx = self.rng.choices(range(len(entries)), weights=weights, k=1)[0]
+            entry = entries[idx]
+
+        base, gender = entry[0], entry[1]
+        forms = entry[3] if len(entry) > 3 and isinstance(entry[3], dict) else None
+        word = forms.get(self.state.subject_number, base) if forms else base
+
+        # bias is keyed on the base form, so discard that, not the inflected one
+        self.bias.discard(_clean(base))
+        return word, gender
 
     # -------- emission --------
 
@@ -375,6 +390,13 @@ class Sequencer:
         st.copula_noun_done = False
         st.needs_main = False
 
+    def _bump(self) -> None:
+        """Shared per-word bookkeeping for the plain emitters."""
+        st = self.state
+        st.words += 1
+        st.tokens += 1
+        st.sentence_tokens += 1
+
     def _emit_role(self, role: str) -> None:
         st = self.state
 
@@ -382,7 +404,7 @@ class Sequencer:
             self._emit_punct(role)
             st.tokens += 1
             st.sentence_tokens += 1
-            if role in ".!?":
+            if role in (".", "!", "?"):  # FIX: tuple, not a substring test
                 st.sentences += 1
                 self._reset_sentence_flags()
             else:
@@ -414,19 +436,15 @@ class Sequencer:
             word, _ = self._pick_word("O")
             self._emit_word(word)
             self._record(word)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             self._advance("O")
             return
 
         if role == "D":
-            w, g = self._pick_word("D")
+            w, _ = self._pick_word("D")
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             self._advance("D")
             return
 
@@ -435,13 +453,12 @@ class Sequencer:
             entries = [e for e in self.lexicon.get("R", []) if e[1] == gender]
             if not entries:
                 entries = self.lexicon.get("R") or [("they", "n", 1.0)]
-            # O(log n) not needed for tiny list
-            w, g, _ = self.rng.choice(entries)
+            picked = self.rng.choice(entries)
+            w, g = picked[0], picked[1]
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self.bias.discard(_clean(w))
+            self._bump()
             st.have_subject = True
             st.subject_number = "plur" if g == "n" else "sing"
             self._advance("R")
@@ -452,12 +469,12 @@ class Sequencer:
             entries = [e for e in self.lexicon.get("X", []) if e[1] == gender]
             if not entries:
                 entries = self.lexicon.get("X") or [("their", "n", 1.0)]
-            w, _, _ = self.rng.choice(entries)
+            picked = self.rng.choice(entries)
+            w = picked[0]
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self.bias.discard(_clean(w))
+            self._bump()
             self._advance("X")
             return
 
@@ -465,9 +482,7 @@ class Sequencer:
             w, _ = self._pick_word(role)
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             st.in_pp = (role == "P")
             self._advance(role)
             return
@@ -476,9 +491,7 @@ class Sequencer:
             w, _ = self._pick_word("C")
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             self._advance("C")
             return
 
@@ -486,9 +499,7 @@ class Sequencer:
             w, _ = self._pick_word("W")
             self._emit_word(w, capitalize=self._sentence_start)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             st.needs_main = True
             self._advance("W")
             return
@@ -497,9 +508,7 @@ class Sequencer:
             w, _ = self._pick_word("K")
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             st.copula_noun_done = False
             self._advance("K")
             return
@@ -508,9 +517,7 @@ class Sequencer:
             w, _ = self._pick_word(role)
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             st.have_verb = True
             st.in_pp = False
             st.after_copula = True
@@ -523,14 +530,11 @@ class Sequencer:
             w, g = self._pick_word(role)
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             was_in_pp = st.in_pp
             st.in_pp = False
             if not was_in_pp:
                 st.subject_gender = g
-                st.last_entity_gender = g
                 st.subject_number = "sing"
                 st.have_subject = True
                 if st.after_copula:
@@ -543,9 +547,7 @@ class Sequencer:
             w, _ = self._pick_word("V")
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             st.have_verb = True
             st.in_pp = False
             st.needs_main = False
@@ -558,398 +560,199 @@ class Sequencer:
             w, _ = self._pick_word("M")
             self._emit_word(w)
             self._record(w)
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
+            self._bump()
             if st.after_copula and st.last_role == "U":
                 st.after_copula = False
             self._advance("M")
             return
 
+        # FIX: an unknown role used to fall through here without counting a
+        # token, so the generation loop could spin on it forever. It now
+        # makes progress (and generate() carries a hard step cap anyway).
         LOG.debug("unhandled role: %s", role)
+        st.tokens += 1
         self._advance(role)
 
-    # -------- main loop --------
+    # -------- prompting --------
 
-    def step(self) -> None:
+    def _mode(self, prompt: str) -> str:
+        if self.mode != "auto":
+            return self.mode
+        if prompt.rstrip().endswith("?"):
+            return "qa"
+        words = re.findall(r"[\w']+", prompt.lower())
+        if words:
+            first = words[0]
+            if first in set(self.qa.get("question_words", [])) or \
+                    first in set(self.qa.get("aux_words", [])):
+                return "qa"
+        return "story"
+
+    def _seed(self, prompt: str, mode: str) -> None:
         st = self.state
-        if st.stopped:
-            return
-        if st.pending_noun is not None:
-            word, gender, role = st.pending_noun
-            st.pending_noun = None
-            self._emit_word(word)
+        self.bias = set()
+
+        # the prompt feeds the same window the output does, so replies
+        # stay on topic and don't parrot the question straight back
+        for w in re.findall(r"[\w']+", prompt.lower()):
+            self.ctx.add(w)
+            if w in self.word_to_role:
+                self.bias.add(w)
+
+        start, forced = START, None
+
+        if mode == "qa":
+            words = re.findall(r"[\w']+", prompt.lower())
+            opener = None
+            for w in words:
+                if w in self.qa.get("openers", {}):
+                    opener = self.qa["openers"][w]
+                    break
+            if opener is None and words and \
+                    words[0] in set(self.qa.get("aux_words", [])):
+                opener = self.qa.get("yes_no", {})
+            if opener is None:
+                opener = self.qa.get("default", {})
+
+            # An opener either forces a first word (with the role it
+            # hands off to), or names a set of roles to open on. If
+            # both are present, the forced word wins -- it's the more
+            # specific instruction, and applying both just clobbered
+            # the role choice on the floor.
+            pool = opener.get("words") or []
+            roles = opener.get("roles") or []
+            if pool:
+                forced = self.rng.choice(pool)
+            elif roles:
+                start = self.rng.choice(roles)
+        elif self.bias:
+            # story about specific things: open on one of them, usually
+            if self.rng.random() < 0.7:
+                w = sorted(self.bias)[self.rng.randrange(len(self.bias))]
+                r = self.word_to_role.get(w)
+                if r in self.transitions:
+                    start = r
+
+        st.last_role = start
+
+        if forced is not None:
+            word, after = forced
+            self._emit_word(word, capitalize=True)
             self._record(word)
+            self.bias.discard(_clean(word))  # FIX: opener could self-repeat
             st.words += 1
             st.tokens += 1
             st.sentence_tokens += 1
-            if not st.in_pp:
-                st.subject_gender = gender
-                st.last_entity_gender = gender
-                st.subject_number = "sing"
-                st.have_subject = True
-                if st.after_copula:
-                    st.after_copula = False
-                    st.copula_noun_done = True
-            st.in_pp = False
-            self._advance(role)
-            return
-        role = self._pick_next_role()
-        self._emit_role(role)
+            if after == ",":
+                st.have_verb = False
+            st.last_role = after
 
-    def run(self, max_tokens: int = 300) -> None:
-        while not self.state.stopped and self.state.tokens < max_tokens:
-            self.step()
-        if not self.state.stopped:
-            self.state.stopped = True
-            self._emit_end()
+    def _close(self) -> None:
+        st = self.state
+        if self._needs_space and not self._sentence_start:
+            # FIX: only add a period after a word; stopping right after a
+            # comma used to produce ",."
+            if self._last_char.isalnum():
+                self._emit_punct(".")
+        if self._needs_space:
+            self._emit_newline()
+        st.stopped = True
 
-    # -------- prompt seeding --------
+    def generate(self, prompt: str, budget: Optional[int] = None) -> int:
+        st = self.state
+        # FIX: `stopped` was never reset between calls, so the engine went
+        # permanently silent after the first generation. Same for the
+        # per-sentence flags if a previous turn ended mid-sentence.
+        st.stopped = False
+        self._reset_sentence_flags()
 
-    def seed_from_prompt(self, prompt: str) -> None:
-        tokens = prompt.split()
-        if not tokens:
-            return
-        w2r = self.pack["word_to_role"]
-        for tok in tokens:
-            if tok in (".", "!", "?", ","):
-                self._emit_punct(tok)
-                self.state.tokens += 1
-                self.state.sentence_tokens += 1
-                if tok in ".!?":
-                    self.state.sentences += 1
-                    self._reset_sentence_flags()
-                self._advance(tok)
-                continue
+        prompt = (prompt or "").strip()
+        mode = self._mode(prompt)
+        if budget is None:
+            budget = int(self.qa.get("answer_tokens", 60)) if mode == "qa" \
+                else int(self.params.get("story_tokens", 320))
+        budget = max(1, int(budget))
 
-            clean = tok.lower().strip("，。！？、,.!?;:\"'")
-            role = w2r.get(clean)
-            self._emit_word(tok)
-            self._record(tok)
-            self.state.words += 1
-            self.state.tokens += 1
-            self.state.sentence_tokens += 1
+        self._seed(prompt, mode)
 
-            if role in ("N", "A"):
-                gender = None
-                for w, g, _ in self.lexicon.get(role, []):
-                    if w.lower() == clean:
-                        gender = g
-                        break
-                self.state.in_pp = False
-                if not self.state.have_subject:
-                    self.state.subject_gender = gender or "n"
-                    self.state.last_entity_gender = gender or "n"
-                    self.state.subject_number = "sing"
-                    self.state.have_subject = True
-                elif gender:
-                    self.state.last_entity_gender = gender
-                if self.state.after_copula:
-                    self.state.after_copula = False
-                    self.state.copula_noun_done = True
+        # FIX: the budget used to compare against the cumulative st.tokens,
+        # which never resets -- after the first story every later turn was
+        # over budget before it started. Count per call instead.
+        used = 0
+        steps = 0
+        max_steps = budget * 4 + 64  # FIX: hard cap against pathological loops
 
-            elif role in ("L", "J", "B", "E", "T"):
-                self.state.in_pp = False
-                if not self.state.have_subject:
-                    self.state.subject_gender = "i"
-                    self.state.last_entity_gender = "i"
-                    self.state.have_subject = True
+        while not st.stopped and used < budget and steps < max_steps:
+            role = self._pick_next_role()
+            before = st.tokens
+            self._emit_role(role)
+            used += st.tokens - before
+            steps += 1
 
-            elif role == "V":
-                self.state.have_verb = True
-                if self.state.after_copula:
-                    self.state.after_copula = False
-
-            elif role in ("U", "COP"):
-                self.state.have_verb = True
-                self.state.after_copula = True
-                self.state.copula_noun_done = False
-
-            elif role == "P":
-                self.state.in_pp = True
-
-            elif role == "W":
-                self.state.needs_main = True
-
-            if role:
-                self._advance(role)
-            else:
-                self._advance("N")
-
-        self.state.after_copula = False
-        self.state.copula_noun_done = False
-        self.state.needs_main = False
-
-
-# ===========================================================================
-# Validation
-# ===========================================================================
-
-def validate_lexicon(code: str) -> List[str]:
-    problems: List[str] = []
-    pack = LANGS[code]
-    lex = pack["lexicon"]
-    tr = pack["transitions"]
-    for role, entries in lex.items():
-        if not entries:
-            problems.append(f"[{code}] empty role: {role}")
-            continue
-        seen = set()
-        for w, _g, base in entries:
-            key = w.lower()
-            if key and key in seen:
-                problems.append(f"[{code}] duplicate '{w}' in {role}")
-            seen.add(key)
-            if base <= 0:
-                problems.append(f"[{code}] nonpositive weight for '{w}'")
-    for role in tr:
-        if role not in lex and role not in (START,):
-            # transitions may reference START
-            pass
-    for role, dist in tr.items():
-        for target in dist:
-            if target not in tr and target not in lex:
-                problems.append(
-                    f"[{code}] {role} -> unknown role {target!r}")
-    return problems
-
-
-def _sentence_checker(text: str, code: str) -> List[str]:
-    problems: List[str] = []
-    if code in ("en",):
-        if re.search(r"[ ,.!?]", text) and re.search(r"\s[,.]", text):
-            problems.append(f"[{code}] space before punctuation")
-        if "  " in text:
-            problems.append(f"[{code}] doubled space")
-        for m in re.finditer(r"\.\s+([a-z])", text):
-            problems.append(f"[{code}] lowercase after period: "
-                            f"{m.group(0)!r}")
-            break
-    return problems
-
-
-def run_self_check() -> int:
-    problems: List[str] = []
-    for code in LANGS:
-        problems.extend(validate_lexicon(code))
-
-    try:
-        buf = io.StringIO()
-        stdout = sys.stdout
-        sys.stdout = buf
-        try:
-            prompts = {
-                "en": "The knight went",
-            }
-            for code, prompt in prompts.items():
-                eng = Sequencer(lang=code, seed=42, stream=False, speed=0.0)
-                sys.stdout.write(f"[{code}] ")
-                eng.seed_from_prompt(prompt)
-                eng.run(max_tokens=200)
-                sys.stdout.write("\n")
-        finally:
-            sys.stdout = stdout
-        out = buf.getvalue()
-        for code in LANGS:
-            if f"[{code}]" not in out:
-                problems.append(f"smoke test missing output for {code}")
-        if END not in out:
-            problems.append("smoke test: no <end> token")
-    except Exception as exc:  # noqa: BLE001
-        problems.append(f"smoke test raised: {exc!r}")
-
-    if problems:
-        print(f"SELF-CHECK FAILED ({len(problems)} issue(s)):")
-        for p in problems:
-            print(f"  - {p}")
-        return 1
-
-    parts = []
-    for code, pack in LANGS.items():
-        n = sum(len(v) for v in pack["lexicon"].values())
-        parts.append(f"{code}:{n} items/{len(pack['transitions'])} roles")
-    print("SELF-CHECK PASSED — " + "; ".join(parts))
-    return 0
+        if not st.stopped:
+            self._close()
+        return used
 
 
 # ===========================================================================
 # CLI
 # ===========================================================================
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+def main(argv: Optional[List[str]] = None) -> None:
+    ap = argparse.ArgumentParser(
         prog="sequencer-1.1",
-        description="Sequencer-1.1 — token-by-token generation engine "
-                    "(stdlib only).")
-    p.add_argument("prompt", nargs="*", metavar="WORDS",
-                   help="optional prompt (else interactive REPL)")
-    p.add_argument("-n", "--tokens", type=int, default=300,
-                   help="max tokens per generation (default 300)")
-    p.add_argument("-c", "--count", type=int, default=1,
-                   help="number of generations in one-shot mode")
-    p.add_argument("--seed", type=int, default=None,
-                   help="RNG seed for reproducible output")
-    p.add_argument("--speed", type=float, default=0.02,
-                   help="base streaming delay in seconds (default 0.02)")
-    p.add_argument("--no-stream", action="store_true",
-                   help="print instantly")
-    p.add_argument("--lang", choices=sorted(LANGS), default=None,
-                   help="force a language (else auto-detect from prompt)")
-    p.add_argument("--list-langs", action="store_true",
-                   help="list supported languages and exit")
-    p.add_argument("--hide-end", action="store_true",
-                   help="suppress <end> (still stops)")
-    p.add_argument("--stats", action="store_true",
-                   help="print stats on exit")
-    p.add_argument("--check", action="store_true",
-                   help="validate lexicons and smoke test")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="debug logging to stderr")
-    p.add_argument("--version", action="version", version="Sequencer-1.1")
-    return p
+        description="token-by-token text engine -- stories, answers, whatever")
+    ap.add_argument("-p", "--prompt", default="",
+                    help="prompt; end with ? or start with who/what/... for an answer")
+    ap.add_argument("--mode", choices=["auto", "story", "qa"], default="auto")
+    ap.add_argument("--lang", default=None,
+                    help="language pack to use; falls back to the default "
+                         "when no pack ships for the detected language")
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--speed", type=float, default=0.02,
+                    help="pause between tokens, seconds (0 = flat out)")
+    ap.add_argument("--tokens", type=int, default=None, help="token cap")
+    ap.add_argument("--no-stream", action="store_true")
+    ap.add_argument("--hide-end", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
 
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
+                        format="%(message)s")
 
-HELP_TEXT = """commands:
-  /help              show this help
-  /stats             show session statistics
-  /lang              show current language
-  /lang <code>       switch language (en)
-  /list-langs        list supported languages
-  /seed <int>        reseed the RNG
-  /tokens <int>      max tokens per generation (default 300)
-  /exit              quit"""
+    params = load_params()
+    fallback = params.get("default_lang", "en")
+    packs = params.get("packs", {})
 
+    # detect_lang table is still around, it just lives in the json now.
+    # Whichever language we end up with, it has to have a pack, or we
+    # fall back to the default.
+    lang = args.lang or detect_lang(args.prompt, params.get("detect_lang", []))
+    if not lang or lang not in packs:  # FIX: detect_lang may return ""
+        LOG.warning("no pack for %s; falling back to %s", lang, fallback)
+        lang = fallback
 
-def _print_langs() -> None:
-    for code in sorted(LANGS):
-        pack = LANGS[code]
-        print(f"  {code}  {pack['name']:<22} {pack['native']}")
+    eng = Sequencer(params, seed=args.seed, stream=not args.no_stream,
+                    speed=args.speed, show_end=not args.hide_end,
+                    mode=args.mode, lang=lang)
 
+    if args.prompt:
+        eng.generate(args.prompt, budget=args.tokens)
+        return
 
-def repl(eng: Sequencer) -> None:
-    print("Welcome to Sequencer-1.1!")
-    print(f"current language: {eng.lang} — {eng.pack['name']}")
-    print("/help for commands.\n")
-    max_tokens = 300
+    # no prompt: tiny repl. the context window carries across turns.
+    print("Sequencer-1.1. empty line quits.")
     while True:
         try:
             line = input(">>> ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nGoodbye.")
+        except (EOFError, KeyboardInterrupt):
+            print()
             break
         if not line:
-            continue
-        low = line.lower()
-        if low in ("exit", "quit", "/exit", "/quit"):
             break
-        if low in ("/help", "help"):
-            print(HELP_TEXT)
-            continue
-        if low == "/list-langs":
-            _print_langs()
-            continue
-        if low == "/lang":
-            print(f"current language: {eng.lang} — {eng.pack['name']}")
-            continue
-        if low.startswith("/lang "):
-            code = line.split(None, 1)[1].strip()
-            if code in LANGS:
-                eng.set_lang(code)
-                print(f"language set to {code} — {eng.pack['name']}")
-            else:
-                print(f"unknown language: {code}. "
-                      f"try one of {', '.join(sorted(LANGS))}")
-            continue
-        if low == "/stats":
-            s = eng.state
-            print(f"lang={eng.lang} tokens={s.tokens} words={s.words} "
-                  f"sentences={s.sentences} ctx={len(s.context)}")
-            continue
-        try:
-            if line.startswith("/seed"):
-                eng.rng = random.Random(int(line.split()[1]))
-                print("seed set")
-                continue
-            if line.startswith("/tokens"):
-                max_tokens = int(line.split()[1])
-                print(f"max tokens: {max_tokens}")
-                continue
-        except (IndexError, ValueError):
-            print("usage: /seed <int> | /tokens <int>")
-            continue
-
-        # Auto-detect from the prompt if it clearly belongs to another
-        # language. The user's explicit /lang always wins if they set it.
-        detected = detect_lang(line)
-        if detected != eng.lang and detected in LANGS:
-            eng.set_lang(detected)
-            print(f"[auto-detected: {detected} — {eng.pack['name']}]")
-
-        eng.state = State()
-        eng._needs_space = False
-        eng._sentence_start = True
-        print("Output:", end=" " if eng.render.spaces else "")
-        sys.stdout.flush()
-        eng.seed_from_prompt(line)
-        eng.run(max_tokens=max_tokens)
+        eng.generate(line, budget=args.tokens)
         print()
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr)
-
-    if args.list_langs:
-        _print_langs()
-        return 0
-
-    if args.check:
-        return run_self_check()
-
-    if args.prompt:
-        prompt = " ".join(args.prompt)
-        lang = args.lang or detect_lang(prompt)
-        if lang not in LANGS:
-            lang = DEFAULT_LANG
-        eng = Sequencer(
-            lang=lang,
-            seed=args.seed,
-            stream=not args.no_stream,
-            speed=0.0 if args.no_stream else max(0.0, args.speed),
-            show_end=not args.hide_end,
-        )
-        for i in range(max(1, args.count)):
-            eng.state = State()
-            eng._needs_space = False
-            eng._sentence_start = True
-            print("Output:", end=" " if eng.render.spaces else "")
-            sys.stdout.flush()
-            eng.seed_from_prompt(prompt)
-            eng.run(max_tokens=args.tokens)
-            if args.count > 1 and i < args.count - 1:
-                print()
-        if args.stats:
-            s = eng.state
-            print(f"\n[stats] lang={eng.lang} tokens={s.tokens} "
-                  f"words={s.words} sentences={s.sentences} "
-                  f"ctx={len(s.context)}",
-                  file=sys.stderr)
-        return 0
-
-    lang = args.lang or DEFAULT_LANG
-    eng = Sequencer(
-        lang=lang,
-        seed=args.seed,
-        stream=not args.no_stream,
-        speed=0.0 if args.no_stream else max(0.0, args.speed),
-        show_end=not args.hide_end,
-    )
-    repl(eng)
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
