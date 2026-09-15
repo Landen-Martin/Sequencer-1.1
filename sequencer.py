@@ -2,9 +2,8 @@
 """
 Sequencer-1.1 -- token-by-token text engine.
 
-Stories, answers, whatever you feed it: end the prompt with a ? (or open
-with who/what/why/...) and it answers instead of narrating. English only.
-Every table the model knows -- words, grammar, the old detect_lang script
+Hand it a prompt and it keeps writing from where you left off. Every
+table the model knows -- words, grammar, the old detect_lang script
 table, the tunables -- lives in db/model.parameters.json. This file is
 just machinery. No third-party dependencies.
 """
@@ -43,33 +42,38 @@ def _clean(w: str) -> str:
 
 
 def load_params(path: Path = PARAM_FILE) -> dict:
-    # nothing is baked into the code anymore, so a missing file is fatal
     if not path.exists():
         sys.exit(f"sequencer: can't find {path}, refusing to make things up")
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
-    except json.JSONDecodeError as exc:  # FIX: readable error, not a traceback
+    except json.JSONDecodeError as exc:
         sys.exit(f"sequencer: {path} isn't valid json: {exc}")
 
 
-def detect_lang(text: str, table: List[dict]) -> str:
-    """Same script table the old builds used, it just loads from the json
-    now. Only english ships a pack, so other hits fall back in main()."""
-    # FIX: an empty or missing table used to raise IndexError on table[-1]
+def detect_lang(text: str, table) -> str:
+    """Script-sniffing table from the json. Accepts either the flat
+    {lang: pattern} mapping the file ships (with an optional 'default'
+    key), or the older list of {lang, pattern} rows."""
     if not table:
         return ""
-    fallback = table[-1].get("lang", "")
+    if isinstance(table, dict):
+        fallback = table.get("default", "")
+        rows = [{"lang": k, "pattern": v}
+                for k, v in table.items() if k != "default"]
+    else:
+        fallback = table[-1].get("lang", "") if table else ""
+        rows = table
     if not text:
         return fallback
-    for row in table:
+    for row in rows:
         pat = row.get("pattern", "")
         if not pat:
             continue
         try:
             if re.search(pat, text):
                 return row["lang"]
-        except re.error:  # FIX: a bad pattern in the table shouldn't crash us
+        except re.error:
             LOG.warning("bad detect_lang pattern: %r", pat)
     return fallback
 
@@ -160,18 +164,23 @@ class Sequencer:
 
     def __init__(self, params: dict, seed: Optional[int] = None,
                  stream: bool = True, speed: float = 0.02,
-                 show_end: bool = True, mode: str = "auto",
+                 show_end: bool = True,
                  lang: Optional[str] = None) -> None:
         self.params = params
         self.lang = lang or params.get("default_lang", "en")
-        packs = params.get("packs", {})
+        # The shipped parameters file keeps lexicon/transitions at the
+        # top level with no "packs" wrapper, so treat it as a single
+        # default pack if that key isn't there.
+        packs = params.get("packs")
+        if not packs:
+            packs = {self.lang: params}
         if self.lang not in packs:
             sys.exit(f"sequencer: no pack for {self.lang!r} in the json")
         pack = packs[self.lang]
         try:
             self.lexicon: Dict[str, list] = pack["lexicon"]
             self.transitions: Dict[str, dict] = pack["transitions"]
-        except KeyError as exc:  # FIX: readable error instead of KeyError
+        except KeyError as exc:
             sys.exit(f"sequencer: pack {self.lang!r} is missing {exc}")
         r = pack.get("render", {})
         self.render = RenderCfg(r.get("spaces", True), r.get("capitalize", True),
@@ -180,13 +189,11 @@ class Sequencer:
         self.word_order = pack.get("word_order", "SVO")
         self.word_to_role = self._build_word_to_role(self.lexicon)
 
-        self.qa = params.get("qa", {})
         self.ctx = ContextWindow(params.get("context_chars", 512))
         w = params.get("weights", {})
         self.w_decay = float(w.get("repeat_decay", 0.4))
         self.w_bias = float(w.get("prompt_bias", 2.2))
 
-        self.mode = mode
         self.rng = random.Random(seed)
         self.stream = stream
         self.speed = speed
@@ -195,7 +202,7 @@ class Sequencer:
         self.bias: Set[str] = set()
         self._needs_space = False
         self._sentence_start = True
-        self._last_char = ""  # FIX: so _close can avoid writing ",."
+        self._last_char = ""
 
     @staticmethod
     def _build_word_to_role(lexicon: Dict[str, list]) -> Dict[str, str]:
@@ -244,10 +251,16 @@ class Sequencer:
         self._sentence_start = True
 
     def _emit_end(self) -> None:
+        # Same bookkeeping as _emit_newline; otherwise a second
+        # generate() call in the repl starts with a stray space and no
+        # capital letter.
         if self.show_end:
-            self._write_raw((" " if self.render.spaces else "") + END + "\n")
+            sep = " " if (self.render.spaces and self._needs_space) else ""
+            self._write_raw(sep + END + "\n")
         else:
             self._write_raw("\n")
+        self._needs_space = False
+        self._sentence_start = True
 
     # -------- weighting --------
 
@@ -267,8 +280,6 @@ class Sequencer:
 
     def _pick_role_from(self, last: str) -> str:
         st = self.state
-        # FIX: missing START key used to raise KeyError; empty dist used
-        # to hand START straight back and spin the generator forever
         dist = dict(self.transitions.get(last)
                     or self.transitions.get(START) or {})
 
@@ -298,8 +309,6 @@ class Sequencer:
         st = self.state
 
         if st.copula_noun_done:
-            # FIX: used to check the transition table, which could force a
-            # role with no lexicon entries (and print the _START_ sentinel)
             if self._can_say("K"):
                 return "K"
             return "."
@@ -315,7 +324,7 @@ class Sequencer:
 
         if role == START:
             role = self._pick_role_from(START)
-            if role == START:  # FIX: no transitions at all -> stop cleanly
+            if role == START:  # no transitions at all -> stop cleanly
                 role = "."
 
         if role == "R" and not st.subject_gender:
@@ -352,8 +361,7 @@ class Sequencer:
         stays valid.
         """
         entries = self.lexicon.get(role)
-        # FIX: the old fallback was [(START, "", 1.0)], which printed the
-        # literal sentinel word. A missing role now yields no word at all.
+        # A missing role yields no word, rather than printing a sentinel.
         if not entries:
             return "", ""
 
@@ -404,7 +412,7 @@ class Sequencer:
             self._emit_punct(role)
             st.tokens += 1
             st.sentence_tokens += 1
-            if role in (".", "!", "?"):  # FIX: tuple, not a substring test
+            if role in (".", "!", "?"):
                 st.sentences += 1
                 self._reset_sentence_flags()
             else:
@@ -566,29 +574,14 @@ class Sequencer:
             self._advance("M")
             return
 
-        # FIX: an unknown role used to fall through here without counting a
-        # token, so the generation loop could spin on it forever. It now
-        # makes progress (and generate() carries a hard step cap anyway).
+        # Unknown role: count a token so the loop still makes progress.
         LOG.debug("unhandled role: %s", role)
         st.tokens += 1
         self._advance(role)
 
     # -------- prompting --------
 
-    def _mode(self, prompt: str) -> str:
-        if self.mode != "auto":
-            return self.mode
-        if prompt.rstrip().endswith("?"):
-            return "qa"
-        words = re.findall(r"[\w']+", prompt.lower())
-        if words:
-            first = words[0]
-            if first in set(self.qa.get("question_words", [])) or \
-                    first in set(self.qa.get("aux_words", [])):
-                return "qa"
-        return "story"
-
-    def _seed(self, prompt: str, mode: str) -> None:
+    def _seed(self, prompt: str) -> None:
         st = self.state
         self.bias = set()
 
@@ -599,59 +592,36 @@ class Sequencer:
             if w in self.word_to_role:
                 self.bias.add(w)
 
-        start, forced = START, None
-
-        if mode == "qa":
-            words = re.findall(r"[\w']+", prompt.lower())
-            opener = None
-            for w in words:
-                if w in self.qa.get("openers", {}):
-                    opener = self.qa["openers"][w]
-                    break
-            if opener is None and words and \
-                    words[0] in set(self.qa.get("aux_words", [])):
-                opener = self.qa.get("yes_no", {})
-            if opener is None:
-                opener = self.qa.get("default", {})
-
-            # An opener either forces a first word (with the role it
-            # hands off to), or names a set of roles to open on. If
-            # both are present, the forced word wins -- it's the more
-            # specific instruction, and applying both just clobbered
-            # the role choice on the floor.
-            pool = opener.get("words") or []
-            roles = opener.get("roles") or []
-            if pool:
-                forced = self.rng.choice(pool)
-            elif roles:
-                start = self.rng.choice(roles)
-        elif self.bias:
-            # story about specific things: open on one of them, usually
-            if self.rng.random() < 0.7:
-                w = sorted(self.bias)[self.rng.randrange(len(self.bias))]
-                r = self.word_to_role.get(w)
-                if r in self.transitions:
-                    start = r
+        start = START
+        words = re.findall(r"[\w']+", prompt.lower())
+        if words:
+            # Continue from the last word the prompt ended on rather than
+            # rolling a fresh sentence somewhere else. "the" should lead
+            # into a noun, "walked" into a phrase. The flags below mirror
+            # what emitting that word would have done, so the next role
+            # isn't forced back to the start of a sentence.
+            last = words[-1]
+            r = self.word_to_role.get(last)
+            if r and r in self.transitions:
+                start = r
+                if r in ("N", "A", "J", "L", "B", "E", "T"):
+                    st.have_subject = True
+                    st.subject_number = "sing"
+                    for entry in self.lexicon.get(r, []):
+                        if _clean(entry[0]) == last:
+                            if entry[1]:
+                                st.subject_gender = entry[1]
+                            break
+                elif r in ("V", "U"):
+                    st.have_verb = True
 
         st.last_role = start
-
-        if forced is not None:
-            word, after = forced
-            self._emit_word(word, capitalize=True)
-            self._record(word)
-            self.bias.discard(_clean(word))  # FIX: opener could self-repeat
-            st.words += 1
-            st.tokens += 1
-            st.sentence_tokens += 1
-            if after == ",":
-                st.have_verb = False
-            st.last_role = after
 
     def _close(self) -> None:
         st = self.state
         if self._needs_space and not self._sentence_start:
-            # FIX: only add a period after a word; stopping right after a
-            # comma used to produce ",."
+            # only add a period after a word; stopping right after a
+            # comma would otherwise produce ",."
             if self._last_char.isalnum():
                 self._emit_punct(".")
         if self._needs_space:
@@ -660,27 +630,22 @@ class Sequencer:
 
     def generate(self, prompt: str, budget: Optional[int] = None) -> int:
         st = self.state
-        # FIX: `stopped` was never reset between calls, so the engine went
-        # permanently silent after the first generation. Same for the
-        # per-sentence flags if a previous turn ended mid-sentence.
         st.stopped = False
         self._reset_sentence_flags()
 
         prompt = (prompt or "").strip()
-        mode = self._mode(prompt)
         if budget is None:
-            budget = int(self.qa.get("answer_tokens", 60)) if mode == "qa" \
-                else int(self.params.get("story_tokens", 320))
+            budget = int(self.params.get("tokens", 320))
         budget = max(1, int(budget))
 
-        self._seed(prompt, mode)
+        self._seed(prompt)
 
-        # FIX: the budget used to compare against the cumulative st.tokens,
-        # which never resets -- after the first story every later turn was
-        # over budget before it started. Count per call instead.
+        # Count tokens per call -- st.tokens is cumulative for stats, so
+        # comparing the budget against it would make every turn after the
+        # first start out "over budget".
         used = 0
         steps = 0
-        max_steps = budget * 4 + 64  # FIX: hard cap against pathological loops
+        max_steps = budget * 4 + 64
 
         while not st.stopped and used < budget and steps < max_steps:
             role = self._pick_next_role()
@@ -701,10 +666,10 @@ class Sequencer:
 def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(
         prog="sequencer-1.1",
-        description="token-by-token text engine -- stories, answers, whatever")
+        description="token-by-token text engine. give it a prompt, it "
+                    "keeps writing from where you left off.")
     ap.add_argument("-p", "--prompt", default="",
-                    help="prompt; end with ? or start with who/what/... for an answer")
-    ap.add_argument("--mode", choices=["auto", "story", "qa"], default="auto")
+                    help="prompt to continue from")
     ap.add_argument("--lang", default=None,
                     help="language pack to use; falls back to the default "
                          "when no pack ships for the detected language")
@@ -722,19 +687,19 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     params = load_params()
     fallback = params.get("default_lang", "en")
-    packs = params.get("packs", {})
 
-    # detect_lang table is still around, it just lives in the json now.
-    # Whichever language we end up with, it has to have a pack, or we
-    # fall back to the default.
+    packs = params.get("packs")
+    if not packs:
+        packs = {fallback: params}
+
     lang = args.lang or detect_lang(args.prompt, params.get("detect_lang", []))
-    if not lang or lang not in packs:  # FIX: detect_lang may return ""
+    if not lang or lang not in packs:
         LOG.warning("no pack for %s; falling back to %s", lang, fallback)
         lang = fallback
 
     eng = Sequencer(params, seed=args.seed, stream=not args.no_stream,
                     speed=args.speed, show_end=not args.hide_end,
-                    mode=args.mode, lang=lang)
+                    lang=lang)
 
     if args.prompt:
         eng.generate(args.prompt, budget=args.tokens)
