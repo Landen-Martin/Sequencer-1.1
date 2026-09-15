@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Sequencer-1.1 -- token-by-token text engine.
+Sequencer-1.1 -- token-by-token text engine, three-layer edition.
 
-Hand it a prompt and it keeps writing from where you left off. Every
-table the model knows -- words, grammar, the old detect_lang script
-table, the tunables -- lives in db/model.parameters.json. This file is
-just machinery. No third-party dependencies.
+Every token is chosen by scoring all plausible (role, word) candidates
+through three layers, then sampling from a softmax:
+
+    Layer 1  Base            -- transition table + structural overrides
+    Layer 2  Interdependence -- context: repeats, prompt bias, agreement
+    Layer 3  Amen            -- rhythm, closure pressure, budget
+
+The layers add logits, the softmax combines them per token. Every table
+the model knows lives in db/model.parameters.json. This file is just
+machinery. No third-party dependencies.
 """
 
 from __future__ import annotations
@@ -32,8 +38,6 @@ EMPTY = "<empty>"
 
 PARAM_FILE = Path(__file__).resolve().parent / "db" / "model.parameters.json"
 
-# Tokens are lowercased and stripped of these marks; the CJK punctuation
-# rides along so it doesn't wedge itself into a "word".
 _STRIP = "，。！？、,.!?;:\"'"
 
 
@@ -99,12 +103,8 @@ class RenderCfg:
 class ContextWindow:
     """
     The last `size` characters worth of tokens, plus a running count of
-    how many times each token appears in the window.
-
-    `counts` answers "did we already say this?" in O(1), and it is
-    pruned as the window slides, so it always reflects exactly the
-    tokens still in `buf`. No sorted copy needed -- the counter *is*
-    the membership test.
+    how many times each token appears in the window. The counter *is*
+    the membership test -- no sorted copy needed.
     """
 
     def __init__(self, size: int) -> None:
@@ -160,7 +160,7 @@ class State:
 # ===========================================================================
 
 class Sequencer:
-    """Token-by-token generator. Reads everything from the params dict."""
+    """Token-by-token generator. Three scoring layers + softmax per token."""
 
     def __init__(self, params: dict, seed: Optional[int] = None,
                  stream: bool = True, speed: float = 0.02,
@@ -168,9 +168,6 @@ class Sequencer:
                  lang: Optional[str] = None) -> None:
         self.params = params
         self.lang = lang or params.get("default_lang", "en")
-        # The shipped parameters file keeps lexicon/transitions at the
-        # top level with no "packs" wrapper, so treat it as a single
-        # default pack if that key isn't there.
         packs = params.get("packs")
         if not packs:
             packs = {self.lang: params}
@@ -191,8 +188,17 @@ class Sequencer:
 
         self.ctx = ContextWindow(params.get("context_chars", 512))
         w = params.get("weights", {})
-        self.w_decay = float(w.get("repeat_decay", 0.4))
-        self.w_bias = float(w.get("prompt_bias", 2.2))
+        # Layer 2 weights
+        self.lay2_decay = float(w.get("repeat_decay", 0.4))
+        self.lay2_bias = float(w.get("prompt_bias", 2.2))
+        self.lay2_agree = float(w.get("agreement_bonus", 1.5))
+        self.lay2_flow = float(w.get("flow_bonus", 1.0))
+        # Layer 3 weights
+        self.lay3_close = float(w.get("close_bonus", 3.0))
+        self.lay3_early = float(w.get("early_close_penalty", 4.0))
+        self.lay3_budget = float(w.get("budget_pressure", 2.0))
+        self.lay3_dangle = float(w.get("dangling_penalty", 8.0))
+        self.temp = float(w.get("temperature", 1.0))
 
         self.rng = random.Random(seed)
         self.stream = stream
@@ -214,7 +220,9 @@ class Sequencer:
                     w2r[key] = role
         return w2r
 
-    # -------- output --------
+    # ------------------------------------------------------------------
+    # Output plumbing
+    # ------------------------------------------------------------------
 
     def _sleep(self) -> None:
         if self.stream and self.speed > 0:
@@ -251,9 +259,6 @@ class Sequencer:
         self._sentence_start = True
 
     def _emit_end(self) -> None:
-        # Same bookkeeping as _emit_newline; otherwise a second
-        # generate() call in the repl starts with a stray space and no
-        # capital letter.
         if self.show_end:
             sep = " " if (self.render.spaces and self._needs_space) else ""
             self._write_raw(sep + END + "\n")
@@ -262,126 +267,189 @@ class Sequencer:
         self._needs_space = False
         self._sentence_start = True
 
-    # -------- weighting --------
-
-    def _word_weight(self, word: str, base: float) -> float:
-        complexity = 1.0 / (1.0 + math.log(1.0 + len(word)) / 4.0)
-        key = _clean(word)
-        if key in self.bias:
-            # things the prompt asked about jump the queue, once
-            return base * complexity * self.w_bias
-        count = self.ctx.counts.get(key, 0)
-        return base * complexity * (self.w_decay ** count)
-
     def _record(self, word: str) -> None:
         self.ctx.add(word)
 
-    # -------- selection --------
+    # ------------------------------------------------------------------
+    # Layer 1 -- Base
+    #
+    # Raw structural plausibility. Reads the transition table and applies
+    # hard overrides that are structural (not contextual): copula needs
+    # a noun, SVO needs a verb before a close, sentences have a cap.
+    # Everything here is about *slot shape*, not about *which word*.
+    # ------------------------------------------------------------------
 
-    def _pick_role_from(self, last: str) -> str:
-        st = self.state
-        dist = dict(self.transitions.get(last)
-                    or self.transitions.get(START) or {})
-
-        if last == "M" and st.prev_role == "U":
-            dist = {".": 35, NL: 35, ",": 8, "P": 15, "C": 5, "!": 2}
-
-        if last == "D" and st.in_pp:
-            dist = {"L": 55, "J": 15, "B": 10, "E": 10, "A": 5, "N": 5}
-
-        if last in ("N", "A") and not st.have_verb and self.word_order == "SVO":
-            dist = {"V": 75, "U": 15, "K": 5, "P": 3, "C": 2}
-
-        if not dist:
-            return "."
-        roles = list(dist.keys())
-        weights = list(dist.values())
-        total = sum(weights)
-        if total <= 0:
-            return "."
-        return self.rng.choices(roles, weights=weights, k=1)[0]
-
-    def _can_say(self, role: str) -> bool:
-        """A role is only emittable if the lexicon actually has words for it."""
-        return bool(self.lexicon.get(role))
-
-    def _pick_next_role(self) -> str:
+    def _layer1_scores(self) -> Dict[str, float]:
         st = self.state
 
         if st.copula_noun_done:
-            if self._can_say("K"):
-                return "K"
-            return "."
-
-        if st.sentence_tokens >= self.max_sent:
-            return self.rng.choices([".", "!", "?"],
-                                    weights=[85, 10, 5], k=1)[0]
-
-        if st.sentence_tokens >= 15 and st.have_subject and not st.have_verb:
-            return "V" if self._can_say("V") else "."
-
-        role = self._pick_role_from(st.last_role)
-
-        if role == START:
-            role = self._pick_role_from(START)
-            if role == START:  # no transitions at all -> stop cleanly
-                role = "."
-
-        if role == "R" and not st.subject_gender:
-            role = "D" if self._can_say("D") else \
-                   ("N" if self._can_say("N") else ".")
-
-        if role in (".", "!", "?", NL):
-            if not (st.have_subject and st.have_verb):
-                # SVO: force a verb first; SOV would take a particle
-                if st.have_subject:
-                    role = "V" if self._can_say("V") else \
-                           ("PART" if self._can_say("PART") else ".")
-                else:
-                    role = "D" if self._can_say("D") else \
-                           ("N" if self._can_say("N") else ".")
-
-        if st.after_copula and st.last_role == "U" and \
-                role not in ("D", "M", "N", "J", "L", "B", "A"):
-            role = "D" if self._can_say("D") else \
-                   ("M" if self._can_say("M") else ".")
-
-        if st.needs_main and role in (".", "!", "?", NL) and not st.have_verb:
-            role = "V" if self._can_say("V") else "."
-
-        return role
-
-    def _pick_word(self, role: str) -> Tuple[str, str]:
-        """
-        Returns (word, gender). Entries are [word, gender, weight] -- or
-        optionally [word, gender, weight, forms], where `forms` is a
-        number-keyed map of alternate spellings for verbs and copulas,
-        e.g. ["run", "", 1.0, {"sing": "runs"}]. The base word is the
-        fallback when the subject's number isn't listed, so a 3-tuple
-        stays valid.
-        """
-        entries = self.lexicon.get(role)
-        # A missing role yields no word, rather than printing a sentinel.
-        if not entries:
-            return "", ""
-
-        if len(entries) == 1:
-            entry = entries[0]
+            dist = {"K": 80, ".": 15, "!": 3, "?": 2}
+        elif st.sentence_tokens >= self.max_sent:
+            dist = {".": 85, "!": 10, "?": 5}
+        elif st.sentence_tokens >= 15 and st.have_subject and not st.have_verb:
+            dist = {"V": 80, "U": 15, "K": 5}
+        elif st.last_role in (START, NL, EMPTY):
+            dist = dict(self.transitions.get(START) or {})
         else:
-            weights = [max(0.001, self._word_weight(e[0], e[2]))
-                       for e in entries]
-            idx = self.rng.choices(range(len(entries)), weights=weights, k=1)[0]
-            entry = entries[idx]
+            dist = dict(self.transitions.get(st.last_role) or {})
+            if START in dist:
+                # a newline or sentence end routed back to the top --
+                # expand inline so we don't emit a sentinel role
+                del dist[START]
+                for k, v in (self.transitions.get(START) or {}).items():
+                    dist[k] = dist.get(k, 0) + v
 
-        base, gender = entry[0], entry[1]
-        forms = entry[3] if len(entry) > 3 and isinstance(entry[3], dict) else None
-        word = forms.get(self.state.subject_number, base) if forms else base
+            if st.last_role == "M" and st.prev_role == "U":
+                dist = {".": 35, NL: 35, ",": 8, "P": 15, "C": 5, "!": 2}
+            elif st.last_role == "D" and st.in_pp:
+                dist = {"L": 55, "J": 15, "B": 10, "E": 10, "A": 5, "N": 5}
+            elif st.last_role in ("N", "A") and not st.have_verb \
+                    and self.word_order == "SVO":
+                dist = {"V": 75, "U": 15, "K": 5, "P": 3, "C": 2}
 
-        # bias is keyed on the base form, so discard that, not the inflected one
-        self.bias.discard(_clean(base))
-        return word, gender
+        scores: Dict[str, float] = {}
+        for role, w in dist.items():
+            if role == EMPTY:
+                continue
+            if w <= 0:
+                continue
+            scores[role] = math.log(w)
+        if not scores:
+            scores["."] = 0.0
+        return scores
 
-    # -------- emission --------
+    # ------------------------------------------------------------------
+    # Layer 2 -- Interdependence
+    #
+    # Context adjustments. Looks at what's already been said, what the
+    # prompt asked about, and how the current word agrees with the
+    # subject. Also folds in the two-token structural patches (copula
+    # -> noun, PP -> location) that depend on more than one role.
+    # ------------------------------------------------------------------
+
+    def _layer2_adjust(self, role: str, word: Optional[str]) -> float:
+        st = self.state
+        adj = 0.0
+
+        if word:
+            key = _clean(word)
+            # repeat decay: words already in the window get pushed down
+            count = self.ctx.counts.get(key, 0)
+            if count:
+                adj -= count * self.lay2_decay
+            # prompt bias: things the prompt named jump the queue, once
+            if key in self.bias:
+                adj += self.lay2_bias
+
+        # structural continuity from two-token history
+        if st.after_copula and st.last_role == "U":
+            if role in ("D", "M", "N", "J", "L", "B", "A"):
+                adj += self.lay2_flow
+            elif role == "V":
+                adj -= self.lay2_flow
+
+        if st.needs_main:
+            if role == "V":
+                adj += self.lay2_flow
+            elif role in (".", "!", "?"):
+                adj -= self.lay2_flow * 2.0
+
+        return adj
+
+    # ------------------------------------------------------------------
+    # Layer 3 -- Amen
+    #
+    # Polish and finalization. Sentence rhythm, closure pressure, and
+    # budget pressure. This layer is what decides "actually, stop."
+    # ------------------------------------------------------------------
+
+    def _layer3_adjust(self, role: str, word: Optional[str],
+                       remaining: float) -> float:
+        st = self.state
+        adj = 0.0
+
+        # closing punctuation: only if the sentence has a spine, and only
+        # once it's had a few tokens to breathe
+        if role in (".", "!", "?"):
+            if not (st.have_subject and st.have_verb):
+                adj -= self.lay3_dangle
+            elif st.sentence_tokens < 4:
+                adj -= self.lay3_early
+            else:
+                adj += self.lay3_close * min(1.0, st.sentence_tokens / self.max_sent)
+
+        # budget pressure: as we near the cap, boost closers
+        if remaining < 0.15 and role in (".", "!", "?"):
+            adj += self.lay3_budget
+
+        # the end token should only be reachable from a closed sentence
+        if role == END:
+            if not st.have_subject and not st.have_verb:
+                adj -= self.lay3_dangle
+
+        return adj
+
+    # ------------------------------------------------------------------
+    # Candidate generation + softmax
+    # ------------------------------------------------------------------
+
+    def _candidates(self) -> List[Tuple[str, Optional[str], str, float]]:
+        """All plausible (role, word, gender, logit) tuples for this step."""
+        st = self.state
+        role_scores = self._layer1_scores()
+        out: List[Tuple[str, Optional[str], str, float]] = []
+
+        for role, rscore in role_scores.items():
+            if role in (NL, EMPTY, END):
+                out.append((role, None, "", rscore))
+                continue
+
+            entries = self.lexicon.get(role) or []
+            if not entries:
+                continue
+
+            for e in entries:
+                base = e[0]
+                gender = e[1] if len(e) > 1 else ""
+                weight = e[2] if len(e) > 2 else 1.0
+                forms = e[3] if len(e) > 3 and isinstance(e[3], dict) else None
+
+                # gender agreement for pronouns / possessives
+                if role in ("R", "X") and st.subject_gender:
+                    if gender and gender != st.subject_gender:
+                        continue
+
+                word = forms.get(st.subject_number, base) if forms else base
+                wscore = math.log(max(0.001, weight))
+                out.append((role, word, gender, rscore + wscore))
+
+        return out
+
+    def _softmax_pick(self, cands, remaining: float):
+        logits = []
+        for role, word, _g, base_logit in cands:
+            l = base_logit
+            l += self._layer2_adjust(role, word)
+            l += self._layer3_adjust(role, word, remaining)
+            logits.append(l / max(0.01, self.temp))
+
+        m = max(logits)
+        exps = [math.exp(x - m) for x in logits]
+        total = sum(exps)
+        if total <= 0:
+            return cands[-1]
+
+        r = self.rng.random()
+        acc = 0.0
+        for i, e in enumerate(exps):
+            acc += e / total
+            if r <= acc:
+                return cands[i]
+        return cands[-1]
+
+    # ------------------------------------------------------------------
+    # State transitions
+    # ------------------------------------------------------------------
 
     def _advance(self, new_role: str) -> None:
         st = self.state
@@ -399,13 +467,13 @@ class Sequencer:
         st.needs_main = False
 
     def _bump(self) -> None:
-        """Shared per-word bookkeeping for the plain emitters."""
         st = self.state
         st.words += 1
         st.tokens += 1
         st.sentence_tokens += 1
 
-    def _emit_role(self, role: str) -> None:
+    def _emit_pick(self, role: str, word: Optional[str],
+                   gender: str) -> None:
         st = self.state
 
         if role in (".", "!", "?", ","):
@@ -440,146 +508,60 @@ class Sequencer:
             self._advance(END)
             return
 
-        if role == "O":
-            word, _ = self._pick_word("O")
-            self._emit_word(word)
-            self._record(word)
-            self._bump()
-            self._advance("O")
-            return
-
-        if role == "D":
-            w, _ = self._pick_word("D")
-            self._emit_word(w)
-            self._record(w)
-            self._bump()
-            self._advance("D")
-            return
-
-        if role == "R":
-            gender = st.subject_gender or "n"
-            entries = [e for e in self.lexicon.get("R", []) if e[1] == gender]
-            if not entries:
-                entries = self.lexicon.get("R") or [("they", "n", 1.0)]
-            picked = self.rng.choice(entries)
-            w, g = picked[0], picked[1]
-            self._emit_word(w)
-            self._record(w)
-            self.bias.discard(_clean(w))
-            self._bump()
-            st.have_subject = True
-            st.subject_number = "plur" if g == "n" else "sing"
-            self._advance("R")
-            return
-
-        if role == "X":
-            gender = st.subject_gender or "n"
-            entries = [e for e in self.lexicon.get("X", []) if e[1] == gender]
-            if not entries:
-                entries = self.lexicon.get("X") or [("their", "n", 1.0)]
-            picked = self.rng.choice(entries)
-            w = picked[0]
-            self._emit_word(w)
-            self._record(w)
-            self.bias.discard(_clean(w))
-            self._bump()
-            self._advance("X")
-            return
-
-        if role in ("P", "Q", "PART"):
-            w, _ = self._pick_word(role)
-            self._emit_word(w)
-            self._record(w)
-            self._bump()
-            st.in_pp = (role == "P")
+        if not word:
+            # nothing emit-able -- count a token so the loop still moves
+            st.tokens += 1
             self._advance(role)
             return
 
-        if role == "C":
-            w, _ = self._pick_word("C")
-            self._emit_word(w)
-            self._record(w)
-            self._bump()
-            self._advance("C")
-            return
+        self._emit_word(word)
+        self._record(word)
+        self.bias.discard(_clean(word))
+        self._bump()
 
-        if role == "W":
-            w, _ = self._pick_word("W")
-            self._emit_word(w, capitalize=self._sentence_start)
-            self._record(w)
-            self._bump()
+        # role-specific bookkeeping
+        if role == "R":
+            st.have_subject = True
+            st.subject_number = "plur" if gender == "n" else "sing"
+        elif role == "X":
+            pass
+        elif role in ("P", "Q", "PART"):
+            st.in_pp = (role == "P")
+        elif role == "W":
             st.needs_main = True
-            self._advance("W")
-            return
-
-        if role == "K":
-            w, _ = self._pick_word("K")
-            self._emit_word(w)
-            self._record(w)
-            self._bump()
+        elif role == "K":
             st.copula_noun_done = False
-            self._advance("K")
-            return
-
-        if role in ("U", "COP"):
-            w, _ = self._pick_word(role)
-            self._emit_word(w)
-            self._record(w)
-            self._bump()
+        elif role in ("U", "COP"):
             st.have_verb = True
             st.in_pp = False
             st.after_copula = True
             st.copula_noun_done = False
             st.needs_main = False
-            self._advance(role)
-            return
-
-        if role in ("N", "A", "J", "L", "B", "E", "T"):
-            w, g = self._pick_word(role)
-            self._emit_word(w)
-            self._record(w)
-            self._bump()
+        elif role in ("N", "A", "J", "L", "B", "E", "T"):
             was_in_pp = st.in_pp
             st.in_pp = False
             if not was_in_pp:
-                st.subject_gender = g
+                st.subject_gender = gender
                 st.subject_number = "sing"
                 st.have_subject = True
                 if st.after_copula:
                     st.after_copula = False
                     st.copula_noun_done = True
-            self._advance(role)
-            return
-
-        if role == "V":
-            w, _ = self._pick_word("V")
-            self._emit_word(w)
-            self._record(w)
-            self._bump()
+        elif role == "V":
             st.have_verb = True
             st.in_pp = False
             st.needs_main = False
             if st.after_copula:
                 st.after_copula = False
-            self._advance("V")
-            return
-
-        if role == "M":
-            w, _ = self._pick_word("M")
-            self._emit_word(w)
-            self._record(w)
-            self._bump()
+        elif role == "M":
             if st.after_copula and st.last_role == "U":
                 st.after_copula = False
-            self._advance("M")
-            return
 
-        # Unknown role: count a token so the loop still makes progress.
-        LOG.debug("unhandled role: %s", role)
-        st.tokens += 1
         self._advance(role)
 
-    # -------- prompting --------
+    # ------------------------------------------------------------------
+    # Prompt seeding
+    # ------------------------------------------------------------------
 
     def _seed(self, prompt: str) -> None:
         st = self.state
@@ -595,11 +577,10 @@ class Sequencer:
         start = START
         words = re.findall(r"[\w']+", prompt.lower())
         if words:
-            # Continue from the last word the prompt ended on rather than
+            # continue from the last word the prompt ended on rather than
             # rolling a fresh sentence somewhere else. "the" should lead
             # into a noun, "walked" into a phrase. The flags below mirror
-            # what emitting that word would have done, so the next role
-            # isn't forced back to the start of a sentence.
+            # what emitting that word would have done.
             last = words[-1]
             r = self.word_to_role.get(last)
             if r and r in self.transitions:
@@ -609,7 +590,7 @@ class Sequencer:
                     st.subject_number = "sing"
                     for entry in self.lexicon.get(r, []):
                         if _clean(entry[0]) == last:
-                            if entry[1]:
+                            if len(entry) > 1 and entry[1]:
                                 st.subject_gender = entry[1]
                             break
                 elif r in ("V", "U"):
@@ -628,6 +609,10 @@ class Sequencer:
             self._emit_newline()
         st.stopped = True
 
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
     def generate(self, prompt: str, budget: Optional[int] = None) -> int:
         st = self.state
         st.stopped = False
@@ -640,17 +625,18 @@ class Sequencer:
 
         self._seed(prompt)
 
-        # Count tokens per call -- st.tokens is cumulative for stats, so
-        # comparing the budget against it would make every turn after the
-        # first start out "over budget".
         used = 0
         steps = 0
         max_steps = budget * 4 + 64
 
         while not st.stopped and used < budget and steps < max_steps:
-            role = self._pick_next_role()
+            remaining = max(0.0, (budget - used) / float(budget))
+            cands = self._candidates()
+            if not cands:
+                break
+            role, word, gender, _logit = self._softmax_pick(cands, remaining)
             before = st.tokens
-            self._emit_role(role)
+            self._emit_pick(role, word, gender)
             used += st.tokens - before
             steps += 1
 
@@ -665,9 +651,8 @@ class Sequencer:
 
 def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(
-        prog="sequencer-1.1",
-        description="token-by-token text engine. give it a prompt, it "
-                    "keeps writing from where you left off.")
+        prog="sequencer-1.2",
+        description="token-by-token text engine, three-layer edition.")
     ap.add_argument("-p", "--prompt", default="",
                     help="prompt to continue from")
     ap.add_argument("--lang", default=None,
@@ -677,6 +662,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--speed", type=float, default=0.02,
                     help="pause between tokens, seconds (0 = flat out)")
     ap.add_argument("--tokens", type=int, default=None, help="token cap")
+    ap.add_argument("--temp", type=float, default=None,
+                    help="softmax temperature (overrides json)")
     ap.add_argument("--no-stream", action="store_true")
     ap.add_argument("--hide-end", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -701,15 +688,20 @@ def main(argv: Optional[List[str]] = None) -> None:
                     speed=args.speed, show_end=not args.hide_end,
                     lang=lang)
 
+    if args.temp is not None:
+        eng.temp = max(0.01, float(args.temp))
+
     if args.prompt:
         eng.generate(args.prompt, budget=args.tokens)
         return
 
-    # no prompt: tiny repl. the context window carries across turns.
-    print("Sequencer-1.1. empty line quits.")
+    print("Sequencer-1.1. Type /exit to exit")
     while True:
         try:
             line = input(">>> ").strip()
+            if line == "/exit":
+                break
+                
         except (EOFError, KeyboardInterrupt):
             print()
             break
